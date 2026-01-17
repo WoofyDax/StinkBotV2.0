@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-POLYMARKET STINK BID BOT (UPGRADED)
+POLYMARKET STINK BID BOT (HARDENED / "ALL GOTCHAS")
 
-Implements the "gotchas":
-1) Trades BOTH sides (YES/UP and NO/DOWN tokens).
-2) Avoids duplicates: one open order per (token_id, side, price).
-3) Detects fills (partial/full) and auto-posts take-profit SELL orders.
-4) Reconciles local state with exchange state periodically.
+Core idea:
+- Post low "stink" BUY bids (1c/2c/3c) on both outcomes when book convexity looks favorable.
+- If filled, automatically place a take-profit SELL near (ask - 1c) or at least +edge.
+- Strict risk caps based on balance, plus per-market caps.
+- Avoid duplicates robustly (canonical tick prices + exchange reconciliation).
+- Persist state to disk for restart safety.
+- Retry/backoff for flaky APIs.
 
 NO telegram
 NO prediction
@@ -19,15 +21,23 @@ import os
 import sys
 import math
 import time
+import json
+import random
 import logging
-import requests
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+from decimal import Decimal, getcontext, ROUND_FLOOR, ROUND_CEILING, ROUND_HALF_UP
 
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
 from py_clob_client.order_builder.constants import BUY, SELL
+
 
 # ================= CONFIG =================
 
@@ -35,50 +45,65 @@ class Config:
     GAMMA_API = "https://gamma-api.polymarket.com"
     CLOB_API  = "https://clob.polymarket.com"
 
-    # stink ladder
-    STINK_PRICES = [0.01, 0.02, 0.03]
+    # stink ladder (as strings so Decimal is exact)
+    STINK_PRICES = ["0.01", "0.02", "0.03"]
 
     # selection filters
     MIN_24H_VOLUME = 15_000
     MAX_BID_DEPTH_ABOVE = 3_000     # USD depth above stink price
-    MIN_SPREAD = 0.05
+    MIN_SPREAD = Decimal("0.05")
     MIN_TIME_TO_END_MIN = 120       # avoid imminent resolution
 
     # risk
-    MAX_OPEN_EXPOSURE_FRAC = 0.20   # max 20% of balance deployed
-    MAX_PER_MARKET_FRAC    = 0.05
-    HARD_MAX_EXPOSURE      = 200.0
+    MAX_OPEN_EXPOSURE_FRAC = Decimal("0.20")   # max 20% of balance deployed
+    MAX_PER_MARKET_FRAC    = Decimal("0.05")
+    HARD_MAX_EXPOSURE      = Decimal("200.0")
 
     # order rules
-    MIN_NOTIONAL = 1.00
-    MIN_SHARES   = 5
+    MIN_NOTIONAL = Decimal("1.00")
+    MIN_SHARES   = Decimal("5")
     STALE_SECONDS = 180
 
     # exits
-    # After a stink fill, place a take-profit sell around "fair-ish".
-    # This is intentionally simple & conservative.
-    TAKE_PROFIT_MIN_EDGE = 0.08     # at least +8c over fill price when possible
-    TAKE_PROFIT_UNDER_ASK = 0.01    # sell at (best_ask - 1c) when possible
-    PRICE_TICK = 0.01              # Polymarket is typically 1-cent ticks
+    TAKE_PROFIT_MIN_EDGE = Decimal("0.08")     # at least +8c over fill price when possible
+    TAKE_PROFIT_UNDER_ASK = Decimal("0.01")    # sell at (best_ask - 1c) when possible
+    PRICE_TICK = Decimal("0.01")               # 1-cent ticks
+    MIN_PRICE = Decimal("0.01")
+    MAX_PRICE = Decimal("0.99")
 
     LOOP_SLEEP = 6
     REFRESH_MARKETS = 120
-    RECONCILE_OPEN_ORDERS = 60      # pull open orders from exchange periodically
+    RECONCILE_OPEN_ORDERS = 60
+    CHECK_FILLS_EVERY = 1  # check fills each loop (can raise if rate-limited)
+
+    # networking
+    HTTP_TIMEOUT = 12
+    HTTP_RETRIES = 3
+    HTTP_BACKOFF = 0.4
+
+    # state persistence
+    STATE_FILE = os.getenv("STINK_STATE_FILE", "stink_state.json")
 
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
+
+# Decimal precision
+getcontext().prec = 28
+
 
 # ================= LOGGING =================
 
 logging.basicConfig(
-    level=getattr(logging, Config.LOG_LEVEL),
+    level=getattr(logging, Config.LOG_LEVEL, logging.INFO),
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-log = logging.getLogger("STINK+")
+log = logging.getLogger("STINK-HARDENED")
+
 
 # ================= UTIL =================
 
-def utcnow():
+def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 def must_env(k: str) -> str:
@@ -87,17 +112,65 @@ def must_env(k: str) -> str:
         raise RuntimeError(f"Missing env var {k}")
     return v
 
-def clamp(x: float, lo: float, hi: float) -> float:
+def env_int(k: str, default: int) -> int:
+    v = os.getenv(k)
+    if not v:
+        return default
+    return int(v)
+
+def clamp_dec(x: Decimal, lo: Decimal, hi: Decimal) -> Decimal:
     return max(lo, min(hi, x))
 
-def round_tick(px: float) -> float:
-    # round to nearest tick
+def tick_quantize(px: Decimal) -> Decimal:
+    """
+    Canonicalize price to the exchange tick (1c).
+    ROUND_HALF_UP to nearest tick.
+    """
     t = Config.PRICE_TICK
-    return round(px / t) * t
+    q = (px / t).to_integral_value(rounding=ROUND_HALF_UP) * t
+    q = clamp_dec(q, Config.MIN_PRICE, Config.MAX_PRICE)
+    # normalize exponent
+    return q.quantize(t)
+
+def floor_to_tick(px: Decimal) -> Decimal:
+    t = Config.PRICE_TICK
+    q = (px / t).to_integral_value(rounding=ROUND_FLOOR) * t
+    q = clamp_dec(q, Config.MIN_PRICE, Config.MAX_PRICE)
+    return q.quantize(t)
+
+def ceil_to_tick(px: Decimal) -> Decimal:
+    t = Config.PRICE_TICK
+    q = (px / t).to_integral_value(rounding=ROUND_CEILING) * t
+    q = clamp_dec(q, Config.MIN_PRICE, Config.MAX_PRICE)
+    return q.quantize(t)
+
+def safe_iso(dt_str: str) -> Optional[datetime]:
+    if not dt_str:
+        return None
+    try:
+        return datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+# ================= HTTP SESSION (retries) =================
+
+def make_session() -> requests.Session:
+    s = requests.Session()
+    retries = Retry(
+        total=Config.HTTP_RETRIES,
+        backoff_factor=Config.HTTP_BACKOFF,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"]
+    )
+    s.mount("https://", HTTPAdapter(max_retries=retries))
+    s.mount("http://", HTTPAdapter(max_retries=retries))
+    return s
+
 
 # ================= CLIENT =================
 
-def init_client():
+def init_client() -> ClobClient:
     creds = ApiCreds(
         api_key=must_env("POLY_API_KEY"),
         api_secret=must_env("POLY_API_SECRET"),
@@ -112,75 +185,106 @@ def init_client():
         funder=must_env("FUNDER_ADDRESS"),
     )
 
+
 # ================= MARKET DISCOVERY =================
 
-def get_markets():
-    r = requests.get(
+def get_markets(sess: requests.Session) -> List[dict]:
+    r = sess.get(
         f"{Config.GAMMA_API}/markets",
         params=dict(active=True, closed=False, limit=400),
-        timeout=15
+        timeout=Config.HTTP_TIMEOUT
     )
     r.raise_for_status()
-    return r.json()["markets"]
+    j = r.json()
+    return j.get("markets", [])
 
-def extract_tokens_both_sides(mkt) -> List[str]:
-    """
-    Return both outcome token_ids (YES/UP and NO/DOWN) when we can identify them.
-    We key off titles containing yes/up and no/down.
-    """
-    yes = None
-    no = None
-    for o in mkt.get("outcomes", []):
-        title = (o.get("title") or "").lower()
-        tok = (o.get("token") or {}).get("token_id")
-        if not tok:
-            continue
-        if ("yes" in title) or ("up" in title):
-            yes = tok
-        if ("no" in title) or ("down" in title):
-            no = tok
 
-    out = []
-    if yes: out.append(yes)
-    if no:  out.append(no)
-    return out
-
-def market_ok(mkt):
-    if mkt.get("volume24hr", 0) < Config.MIN_24H_VOLUME:
+def market_ok(mkt: dict) -> bool:
+    if float(mkt.get("volume24hr", 0) or 0) < Config.MIN_24H_VOLUME:
         return False
     end = mkt.get("endDate")
-    if end:
-        dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
+    dt = safe_iso(end) if end else None
+    if dt:
         if (dt - utcnow()).total_seconds() < Config.MIN_TIME_TO_END_MIN * 60:
             return False
     return True
 
+
+def extract_tokens_both_sides(mkt: dict) -> List[str]:
+    """
+    More robust token discovery:
+    - First try YES/NO or UP/DOWN title matching
+    - If that fails but there are exactly 2 outcomes w/ token_ids, return both
+    """
+    outs = mkt.get("outcomes", []) or []
+    found = []
+    yes = None
+    no = None
+
+    def tokid(o: dict) -> Optional[str]:
+        t = o.get("token") or {}
+        return t.get("token_id") or t.get("tokenId") or o.get("token_id") or o.get("tokenId")
+
+    for o in outs:
+        title = (o.get("title") or "").strip().lower()
+        tid = tokid(o)
+        if not tid:
+            continue
+        if ("yes" in title) or ("up" in title) or (title == "y"):
+            yes = tid
+        elif ("no" in title) or ("down" in title) or (title == "n"):
+            no = tid
+
+    if yes:
+        found.append(yes)
+    if no and no != yes:
+        found.append(no)
+
+    # Fallback: exactly 2 outcomes
+    if len(found) == 0:
+        tids = []
+        for o in outs:
+            tid = tokid(o)
+            if tid:
+                tids.append(tid)
+        tids = list(dict.fromkeys(tids))
+        if len(tids) == 2:
+            return tids
+
+    return found
+
+
 # ================= ORDERBOOK =================
 
-def get_book(token_id):
-    r = requests.get(f"{Config.CLOB_API}/book/{token_id}", timeout=10)
+def get_book(sess: requests.Session, token_id: str) -> dict:
+    r = sess.get(f"{Config.CLOB_API}/book/{token_id}", timeout=Config.HTTP_TIMEOUT)
     r.raise_for_status()
     return r.json()
 
-def best_bid_ask(book) -> Tuple[Optional[float], Optional[float]]:
-    bid = float(book["bids"][0][0]) if book.get("bids") else None
-    ask = float(book["asks"][0][0]) if book.get("asks") else None
+def best_bid_ask(book: dict) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+    bid = None
+    ask = None
+    try:
+        if book.get("bids"):
+            bid = Decimal(str(book["bids"][0][0]))
+        if book.get("asks"):
+            ask = Decimal(str(book["asks"][0][0]))
+    except Exception:
+        pass
     return bid, ask
 
-def bid_depth_above(book, px):
-    depth = 0.0
-    for p, s in book.get("bids", []):
-        if float(p) >= px:
-            depth += float(p) * float(s)
+def bid_depth_above(book: dict, px: Decimal) -> Decimal:
+    depth = Decimal("0")
+    for p, s in book.get("bids", []) or []:
+        try:
+            pd = Decimal(str(p))
+            sd = Decimal(str(s))
+        except Exception:
+            continue
+        if pd >= px:
+            depth += pd * sd
     return depth
 
-# ================= BALANCE =================
-
-def get_balance(client) -> Optional[float]:
-    try:
-        return float(client.get_balance())
-    except Exception:
-        return None
 
 # ================= BOT STATE =================
 
@@ -189,61 +293,143 @@ class TrackedOrder:
     order_id: str
     token_id: str
     side: str         # BUY or SELL
-    price: float
-    size: float
-    created: datetime
-    filled_size: float = 0.0  # last-known filled amount (for delta detection)
+    price: str        # store as string for exact persistence
+    size: str         # store as string for exact persistence
+    created: str      # iso
+    filled_size: str = "0"
+
+    @staticmethod
+    def from_live(order_id: str, token_id: str, side: str, price: Decimal, size: Decimal, filled: Decimal) -> "TrackedOrder":
+        return TrackedOrder(
+            order_id=order_id,
+            token_id=token_id,
+            side=side,
+            price=str(tick_quantize(price)),
+            size=str(size),
+            created=utcnow().isoformat(),
+            filled_size=str(filled)
+        )
+
+    def price_dec(self) -> Decimal:
+        return Decimal(self.price)
+
+    def size_dec(self) -> Decimal:
+        return Decimal(self.size)
+
+    def filled_dec(self) -> Decimal:
+        return Decimal(self.filled_size)
+
+    def created_dt(self) -> datetime:
+        return safe_iso(self.created) or utcnow()
+
 
 @dataclass
 class PendingExit:
     token_id: str
-    size: float
-    target_price: float
+    size: str
+    target_price: str
 
-class StinkBotPlus:
+    def size_dec(self) -> Decimal:
+        return Decimal(self.size)
+
+    def price_dec(self) -> Decimal:
+        return Decimal(self.target_price)
+
+
+class StinkBotHardened:
     def __init__(self, client: ClobClient):
         self.client = client
+        self.sess = make_session()
 
-        # Keyed by (token_id, side, price) so we don't duplicate
-        self.open_orders: Dict[Tuple[str, str, float], TrackedOrder] = {}
+        # Keyed by (token_id, side, canonical_price_string)
+        self.open_orders: Dict[Tuple[str, str, str], TrackedOrder] = {}
+
+        # exits aggregated per (token_id, target_price)
+        self.exit_queue: Dict[Tuple[str, str], Decimal] = {}
 
         self.last_refresh = utcnow()
         self.last_reconcile = utcnow()
-        self.markets = []
+        self.markets: List[dict] = []
 
-        # Exits to place (generated from fills)
-        self.exit_queue: List[PendingExit] = []
+        self._load_state()
 
-    # -------- exchange helpers (robust to minor API diffs) --------
+    # -------- persistence --------
+
+    def _load_state(self):
+        fn = Config.STATE_FILE
+        if not os.path.exists(fn):
+            return
+        try:
+            with open(fn, "r", encoding="utf-8") as f:
+                st = json.load(f)
+            oo = st.get("open_orders", {})
+            self.open_orders = {}
+            for k, v in oo.items():
+                # key is "token|side|price"
+                parts = k.split("|")
+                if len(parts) != 3:
+                    continue
+                token, side, price = parts
+                self.open_orders[(token, side, price)] = TrackedOrder(**v)
+
+            eq = st.get("exit_queue", {})
+            self.exit_queue = {}
+            for k, v in eq.items():
+                # key "token|price"
+                parts = k.split("|")
+                if len(parts) != 2:
+                    continue
+                token, price = parts
+                self.exit_queue[(token, price)] = Decimal(str(v))
+
+            log.info(f"Loaded state: {len(self.open_orders)} open orders, {len(self.exit_queue)} queued exits")
+        except Exception as e:
+            log.warning(f"Failed to load state ({fn}): {e}")
+
+    def _save_state(self):
+        fn = Config.STATE_FILE
+        try:
+            oo = {}
+            for (token, side, price), o in self.open_orders.items():
+                oo[f"{token}|{side}|{price}"] = asdict(o)
+            eq = {}
+            for (token, price), sz in self.exit_queue.items():
+                eq[f"{token}|{price}"] = str(sz)
+
+            tmp = {
+                "saved_at": utcnow().isoformat(),
+                "open_orders": oo,
+                "exit_queue": eq,
+            }
+            with open(fn, "w", encoding="utf-8") as f:
+                json.dump(tmp, f, indent=2)
+        except Exception as e:
+            log.warning(f"Failed to save state ({fn}): {e}")
+
+    # -------- exchange helpers --------
 
     def _cancel(self, order_id: str):
-        # py_clob_client usually has cancel_order
         return self.client.cancel_order(order_id)
 
-    def _place_order(self, token_id: str, side: str, price: float, size: float) -> Optional[str]:
+    def _place_order(self, token_id: str, side: str, price: Decimal, size: Decimal) -> Optional[str]:
+        price = tick_quantize(price)
         resp = self.client.create_and_post_order(
-            OrderArgs(token_id=token_id, price=price, size=size, side=side),
+            OrderArgs(token_id=token_id, price=float(price), size=float(size), side=side),
             order_type=OrderType.GTC
         )
         oid = resp.get("orderID") or resp.get("id") or resp.get("order_id")
         return oid
 
     def _get_open_orders_exchange(self) -> List[dict]:
-        """
-        Try to pull open orders from exchange.
-        Method names can vary; we attempt common ones.
-        """
         for name in ("get_open_orders", "get_orders", "list_orders"):
             fn = getattr(self.client, name, None)
             if callable(fn):
                 try:
                     res = fn()
-                    # Some versions wrap results in dicts
                     if isinstance(res, dict):
                         for k in ("orders", "data", "results"):
                             if k in res and isinstance(res[k], list):
                                 return res[k]
-                        # if dict but not recognized, fall through
                     if isinstance(res, list):
                         return res
                 except Exception:
@@ -251,9 +437,6 @@ class StinkBotPlus:
         return []
 
     def _get_order_status(self, order_id: str) -> Optional[dict]:
-        """
-        Pull order info for fill detection. Try common names.
-        """
         for name in ("get_order", "get_order_by_id", "read_order"):
             fn = getattr(self.client, name, None)
             if callable(fn):
@@ -263,34 +446,93 @@ class StinkBotPlus:
                     pass
         return None
 
-    # -------- core logic --------
+    def _get_positions(self) -> Dict[str, Decimal]:
+        """
+        Try to get current position sizes by token_id.
+        If unavailable, return {} and we fall back to conservative local accounting.
+        """
+        for name in ("get_positions", "get_holdings", "list_holdings", "get_token_balances"):
+            fn = getattr(self.client, name, None)
+            if callable(fn):
+                try:
+                    res = fn()
+                    pos: Dict[str, Decimal] = {}
+                    # Try a few plausible formats
+                    if isinstance(res, dict):
+                        items = res.get("positions") or res.get("holdings") or res.get("data") or res.get("results") or []
+                    else:
+                        items = res if isinstance(res, list) else []
+                    for it in items:
+                        tid = it.get("token_id") or it.get("tokenId") or it.get("token")
+                        sz = it.get("size") or it.get("balance") or it.get("quantity") or 0
+                        if tid:
+                            try:
+                                pos[tid] = Decimal(str(sz))
+                            except Exception:
+                                continue
+                    return pos
+                except Exception:
+                    pass
+        return {}
 
-    def cleanup_stale(self):
+    def get_balance(self) -> Optional[Decimal]:
+        try:
+            return Decimal(str(self.client.get_balance()))
+        except Exception:
+            return None
+
+    # -------- risk/exposure --------
+
+    def deployed_notional_local(self) -> Decimal:
+        dep = Decimal("0")
+        for o in self.open_orders.values():
+            if o.side == BUY:
+                dep += o.price_dec() * o.size_dec()
+        return dep
+
+    def deployed_notional_exchange_if_possible(self) -> Optional[Decimal]:
+        exch = self._get_open_orders_exchange()
+        if not exch:
+            return None
+        dep = Decimal("0")
+        for od in exch:
+            side = od.get("side")
+            if side != BUY:
+                continue
+            try:
+                px = Decimal(str(od.get("price")))
+                sz = Decimal(str(od.get("size")))
+                dep += tick_quantize(px) * sz
+            except Exception:
+                continue
+        return dep
+
+    # -------- gotcha-proof maintenance --------
+
+    def cleanup_stale_buys(self):
         now = utcnow()
         for key, o in list(self.open_orders.items()):
-            age = (now - o.created).total_seconds()
-            if age > Config.STALE_SECONDS and o.side == BUY:
-                # We only auto-cancel stale BUY stink orders.
-                # If a SELL TP is stale, you might still want it working.
+            if o.side != BUY:
+                continue
+            age = (now - o.created_dt()).total_seconds()
+            if age > Config.STALE_SECONDS:
                 try:
                     self._cancel(o.order_id)
-                    log.info(f"Canceled stale BUY {o.order_id} ({o.token_id} @ {o.price:.2f})")
+                    log.info(f"Canceled stale BUY {o.order_id} ({o.token_id} @ {o.price})")
                 except Exception:
                     pass
                 self.open_orders.pop(key, None)
 
     def reconcile_open_orders(self):
         """
-        Sync local open_orders map with exchange to:
-        - remove canceled/filled orders
-        - ensure restarts don't duplicate
+        Sync local open_orders with exchange, using canonical tick prices.
+        Removes orders no longer live; adds unknown live orders.
         """
         exch = self._get_open_orders_exchange()
-        if not exch:
+        if exch is None:
             return
 
         live_ids = set()
-        # Build a set of live keys we see
         live_keys = set()
 
         for od in exch:
@@ -299,52 +541,54 @@ class StinkBotPlus:
             side  = od.get("side")
             price = od.get("price")
             size  = od.get("size")
-
             if not (oid and token and side and price and size):
                 continue
 
-            price = float(price)
-            size  = float(size)
+            try:
+                px = tick_quantize(Decimal(str(price)))
+                sz = Decimal(str(size))
+                filled = Decimal(str(od.get("filled_size") or od.get("filledSize") or 0))
+            except Exception:
+                continue
+
             live_ids.add(oid)
-            k = (token, side, price)
+            k = (token, side, str(px))
             live_keys.add(k)
 
             if k not in self.open_orders:
-                # Add it with "now" as created if we didn't know about it
-                self.open_orders[k] = TrackedOrder(
-                    order_id=oid,
-                    token_id=token,
-                    side=side,
-                    price=price,
-                    size=size,
-                    created=utcnow(),
-                    filled_size=float(od.get("filled_size") or od.get("filledSize") or 0.0),
+                self.open_orders[k] = TrackedOrder.from_live(
+                    order_id=oid, token_id=token, side=side, price=px, size=sz, filled=filled
                 )
 
-        # Remove local orders that are no longer live on exchange
+        # drop locals not live
         for k, o in list(self.open_orders.items()):
             if o.order_id not in live_ids:
                 self.open_orders.pop(k, None)
 
         log.info(f"Reconciled open orders: {len(self.open_orders)}")
+        self._save_state()
 
-    def compute_take_profit(self, fill_px: float, book) -> float:
+    # -------- fills + exits --------
+
+    def compute_take_profit(self, fill_px: Decimal, book: dict) -> Decimal:
         bid, ask = best_bid_ask(book)
-        # Aim for (ask - 1c), but ensure we capture at least +edge over fill
         target = fill_px + Config.TAKE_PROFIT_MIN_EDGE
-
         if ask is not None:
             target = max(target, ask - Config.TAKE_PROFIT_UNDER_ASK)
+        target = clamp_dec(target, Config.MIN_PRICE, Config.MAX_PRICE)
+        return tick_quantize(target)
 
-        # Clamp to valid [0.01, 0.99] range and tick-round
-        target = clamp(target, 0.01, 0.99)
-        target = round_tick(target)
-        return target
+    def queue_exit(self, token_id: str, target_px: Decimal, delta_size: Decimal):
+        if delta_size <= 0:
+            return
+        px = str(tick_quantize(target_px))
+        k = (token_id, px)
+        self.exit_queue[k] = self.exit_queue.get(k, Decimal("0")) + delta_size
 
     def detect_fills_and_queue_exits(self):
         """
-        For every tracked BUY order, pull status and see if filled increased.
-        If so, enqueue a SELL take-profit for the delta filled amount.
+        For every tracked BUY order, pull status and detect fill deltas.
+        Queue exit sells aggregated by (token, price).
         """
         for k, o in list(self.open_orders.items()):
             if o.side != BUY:
@@ -354,96 +598,127 @@ class StinkBotPlus:
             if not st:
                 continue
 
-            # Typical fields: filled_size / filledSize / executed / etc.
-            filled = (
-                st.get("filled_size")
-                or st.get("filledSize")
-                or st.get("filled")
-                or 0.0
-            )
+            filled_raw = st.get("filled_size") or st.get("filledSize") or st.get("filled") or 0
             try:
-                filled = float(filled)
+                filled = Decimal(str(filled_raw))
             except Exception:
-                filled = o.filled_size
+                filled = o.filled_dec()
 
-            delta = filled - o.filled_size
+            prev = o.filled_dec()
+            delta = filled - prev
+
             if delta > 0:
-                # We got new fills. Queue a TP sell for just the delta.
+                # compute TP
                 try:
-                    book = get_book(o.token_id)
-                    tp = self.compute_take_profit(o.price, book)
+                    book = get_book(self.sess, o.token_id)
+                    tp = self.compute_take_profit(o.price_dec(), book)
                 except Exception:
-                    tp = round_tick(clamp(o.price + Config.TAKE_PROFIT_MIN_EDGE, 0.01, 0.99))
+                    tp = tick_quantize(clamp_dec(o.price_dec() + Config.TAKE_PROFIT_MIN_EDGE, Config.MIN_PRICE, Config.MAX_PRICE))
 
-                self.exit_queue.append(PendingExit(token_id=o.token_id, size=delta, target_price=tp))
-                o.filled_size = filled
+                self.queue_exit(o.token_id, tp, delta)
+
+                o.filled_size = str(filled)
                 self.open_orders[k] = o
 
-                log.info(f"FILL detected: {o.token_id} BUY @ {o.price:.2f} +{delta:.0f}sh (total filled={filled:.0f}). Queue TP SELL @ {tp:.2f}")
+                log.info(f"FILL: {o.token_id} BUY @ {o.price} +{delta}sh (total={filled}). Queue TP @ {tp}")
 
-            # If the order is fully filled or not open anymore, exchange reconcile will remove it later.
-            # But we can also drop it if status says closed/filled.
             status = (st.get("status") or "").lower()
             if status in ("filled", "canceled", "cancelled", "rejected", "expired"):
-                # remove from local (exits already queued via delta fill)
                 self.open_orders.pop(k, None)
 
-    def place_exits(self, bal: float):
+        self._save_state()
+
+    def place_exits(self):
         """
-        Place queued TP SELL orders, avoiding duplicates similarly.
+        Place TP SELLs from the aggregated exit queue.
+        - Enforces min shares / min notional.
+        - Avoids duplicates (token, SELL, price).
+        - Attempts to avoid overselling by checking positions if possible.
         """
-        new_queue = []
-        for ex in self.exit_queue:
-            # ensure minimums
-            px = ex.target_price
-            size = float(ex.size)
+        if not self.exit_queue:
+            return
+
+        # If we can, use real positions to cap sells
+        pos = self._get_positions()  # token -> size
+        have_positions = bool(pos)
+
+        new_queue: Dict[Tuple[str, str], Decimal] = {}
+
+        for (token, px_str), size in list(self.exit_queue.items()):
+            px = Decimal(px_str)
+            size = Decimal(size)
+
+            if size <= 0:
+                continue
+
+            # enforce minimums
             notional = px * size
-
-            if size < Config.MIN_SHARES:
-                # If delta fill smaller than min shares, accumulate it by re-queuing.
-                new_queue.append(ex)
-                continue
-            if notional < Config.MIN_NOTIONAL:
-                new_queue.append(ex)
+            if size < Config.MIN_SHARES or notional < Config.MIN_NOTIONAL:
+                new_queue[(token, px_str)] = new_queue.get((token, px_str), Decimal("0")) + size
                 continue
 
-            key = (ex.token_id, SELL, px)
+            # oversell guard: cap to available position if we can read it
+            if have_positions:
+                available = pos.get(token, Decimal("0"))
+                if available <= 0:
+                    # no inventory (or cannot see it), keep queued but don't place
+                    new_queue[(token, px_str)] = new_queue.get((token, px_str), Decimal("0")) + size
+                    continue
+                if size > available:
+                    # place only what we have, keep remainder queued
+                    place_size = available
+                    rem = size - available
+                else:
+                    place_size = size
+                    rem = Decimal("0")
+            else:
+                place_size = size
+                rem = Decimal("0")
+
+            # avoid duplicates
+            key = (token, SELL, px_str)
             if key in self.open_orders:
-                # already have a TP at this price, don't duplicate
+                # already have a TP at this price; keep remainder queued (if any)
+                if rem > 0:
+                    new_queue[(token, px_str)] = new_queue.get((token, px_str), Decimal("0")) + rem
                 continue
 
             try:
-                oid = self._place_order(ex.token_id, SELL, px, size)
+                oid = self._place_order(token, SELL, px, place_size)
                 if oid:
                     self.open_orders[key] = TrackedOrder(
                         order_id=oid,
-                        token_id=ex.token_id,
+                        token_id=token,
                         side=SELL,
-                        price=px,
-                        size=size,
-                        created=utcnow(),
-                        filled_size=0.0
+                        price=px_str,
+                        size=str(place_size),
+                        created=utcnow().isoformat(),
+                        filled_size="0"
                     )
-                    log.info(f"TP SELL placed: {ex.token_id} @ {px:.2f} size={size:.0f}")
+                    log.info(f"TP SELL placed: {token} @ {px_str} size={place_size}")
                 else:
-                    new_queue.append(ex)
+                    new_queue[(token, px_str)] = new_queue.get((token, px_str), Decimal("0")) + size
+                    continue
             except Exception as e:
-                log.warning(f"Failed placing TP SELL: {e}")
-                new_queue.append(ex)
+                log.warning(f"Failed placing TP SELL ({token} @ {px_str}): {e}")
+                new_queue[(token, px_str)] = new_queue.get((token, px_str), Decimal("0")) + size
+                continue
+
+            if rem > 0:
+                new_queue[(token, px_str)] = new_queue.get((token, px_str), Decimal("0")) + rem
 
         self.exit_queue = new_queue
+        self._save_state()
 
-    def deployed_notional(self) -> float:
-        # Counts open BUY notional as "deployed"; SELLs are exits (not extra exposure)
-        dep = 0.0
-        for o in self.open_orders.values():
-            if o.side == BUY:
-                dep += o.price * o.size
-        return dep
+    # -------- placing stink buys --------
 
-    def maybe_place_stink_buys(self, bal: float):
+    def maybe_place_stink_buys(self, bal: Decimal):
+        # risk caps
         max_exposure = min(Config.HARD_MAX_EXPOSURE, bal * Config.MAX_OPEN_EXPOSURE_FRAC)
-        deployed = self.deployed_notional()
+
+        dep_exch = self.deployed_notional_exchange_if_possible()
+        deployed = dep_exch if dep_exch is not None else self.deployed_notional_local()
+
         if deployed >= max_exposure:
             return
 
@@ -455,34 +730,43 @@ class StinkBotPlus:
             if not tokens:
                 continue
 
-            # Per-market cap
             per_mkt_cap = bal * Config.MAX_PER_MARKET_FRAC
 
             for token in tokens:
+                # pull book once per token per loop
                 try:
-                    book = get_book(token)
+                    book = get_book(self.sess, token)
                 except Exception:
                     continue
 
                 bid, ask = best_bid_ask(book)
-                if not bid or not ask or (ask - bid) < Config.MIN_SPREAD:
+                if bid is None or ask is None:
+                    continue
+                spread = ask - bid
+                if spread < Config.MIN_SPREAD:
                     continue
 
-                for px in Config.STINK_PRICES:
-                    # Skip if we already have this stink order live
-                    key = (token, BUY, float(px))
+                for px_s in Config.STINK_PRICES:
+                    px = Decimal(px_s)
+                    px = tick_quantize(px)
+
+                    # duplicate prevention (canonical tick price string)
+                    key = (token, BUY, str(px))
                     if key in self.open_orders:
                         continue
 
                     depth = bid_depth_above(book, px)
-                    if depth > Config.MAX_BID_DEPTH_ABOVE:
+                    if depth > Decimal(str(Config.MAX_BID_DEPTH_ABOVE)):
                         continue
 
                     budget = min(per_mkt_cap, max_exposure - deployed)
                     if budget < Config.MIN_NOTIONAL:
                         continue
 
-                    size = max(Config.MIN_SHARES, int(math.ceil(Config.MIN_NOTIONAL / px)))
+                    # size is max(MIN_SHARES, ceil(MIN_NOTIONAL/px))
+                    need = (Config.MIN_NOTIONAL / px).to_integral_value(rounding=ROUND_CEILING)
+                    size = max(Config.MIN_SHARES, need)
+
                     if px * size > budget:
                         continue
 
@@ -493,63 +777,81 @@ class StinkBotPlus:
                                 order_id=oid,
                                 token_id=token,
                                 side=BUY,
-                                price=px,
-                                size=size,
-                                created=utcnow(),
-                                filled_size=0.0
+                                price=str(px),
+                                size=str(size),
+                                created=utcnow().isoformat(),
+                                filled_size="0"
                             )
                             deployed += px * size
                             log.info(
-                                f"STINK BUY {px:.2f} size={size} depth_above=${depth:.0f} "
-                                f"vol24h=${mkt.get('volume24hr', 0):.0f} token={token[:8]}..."
+                                f"STINK BUY {px} size={size} depth_above=${depth} "
+                                f"vol24h=${mkt.get('volume24hr', 0)} token={token[:8]}..."
                             )
+                            self._save_state()
                     except Exception as e:
-                        log.warning(f"Order post failed: {e}")
+                        log.warning(f"Order post failed ({token} BUY {px}): {e}")
 
                     if deployed >= max_exposure:
                         return
 
+    # -------- main loop --------
+
     def run(self):
-        self.markets = get_markets()
+        self.markets = get_markets(self.sess)
         self.last_refresh = utcnow()
         log.info(f"Initial markets: {len(self.markets)}")
 
+        # important: reconcile on boot so we don't duplicate after restart
+        try:
+            self.reconcile_open_orders()
+        except Exception:
+            pass
+
+        loops = 0
         while True:
             try:
-                self.cleanup_stale()
+                loops += 1
 
+                # cancel stale stink BUYs
+                self.cleanup_stale_buys()
+
+                # refresh markets
                 if (utcnow() - self.last_refresh).total_seconds() > Config.REFRESH_MARKETS:
-                    self.markets = get_markets()
+                    self.markets = get_markets(self.sess)
                     self.last_refresh = utcnow()
                     log.info(f"Markets refreshed: {len(self.markets)}")
 
+                # reconcile exchange state
                 if (utcnow() - self.last_reconcile).total_seconds() > Config.RECONCILE_OPEN_ORDERS:
                     self.reconcile_open_orders()
                     self.last_reconcile = utcnow()
 
-                bal = get_balance(self.client)
-                if not bal:
+                bal = self.get_balance()
+                if bal is None or bal <= 0:
                     time.sleep(5)
                     continue
 
-                # 1) detect fills and queue exits
-                self.detect_fills_and_queue_exits()
+                # detect fills + queue exits (can be rate-limited; still best to do frequently)
+                if Config.CHECK_FILLS_EVERY <= 1 or (loops % Config.CHECK_FILLS_EVERY == 0):
+                    self.detect_fills_and_queue_exits()
 
-                # 2) place queued TP exits
-                self.place_exits(bal)
+                # place exits
+                self.place_exits()
 
-                # 3) place new stink buys if within risk
+                # place new stink buys
                 self.maybe_place_stink_buys(bal)
 
-                time.sleep(Config.LOOP_SLEEP)
+                # jitter to avoid synchronized bursts
+                time.sleep(Config.LOOP_SLEEP + random.uniform(0, 0.5))
 
             except Exception as e:
                 log.error(f"Loop error: {e}")
                 time.sleep(5)
 
+
 # ================= ENTRY =================
 
 if __name__ == "__main__":
     client = init_client()
-    bot = StinkBotPlus(client)
+    bot = StinkBotHardened(client)
     bot.run()
